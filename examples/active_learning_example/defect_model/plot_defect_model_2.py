@@ -59,7 +59,7 @@ def main(filepath):
         to_mm(Xg),
         to_mm(Yg),
         to_um(mean_grid),
-        [5] + [to_um(crit) for crit in D_CRIT_LIST] + [80, 120, 170],
+        [5] + [to_um(crit) for crit in D_CRIT_LIST] + [80, 120, 180],
         linewidths=2,
     )
 

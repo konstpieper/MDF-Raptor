@@ -193,13 +193,16 @@ def plot_defect_distribution(
         linewidth=2,
         label="Log Gaussian estimate",
     )
-    ax.plot(
-        defect_mesh,
-        st.gaussian_kde(sort_defect)(defect_mesh),
-        color="tab:orange",
-        linewidth=2,
-        label="Gaussian KDE",
-    )
+    try:
+        ax.plot(
+            defect_mesh,
+            st.gaussian_kde(sort_defect)(defect_mesh),
+            color="tab:orange",
+            linewidth=2,
+            label="Gaussian KDE",
+        )
+    except Exception as e:
+        print(f"could not plot Gaussian KDE: {e}, continuing.")
     ax.scatter(
         sort_defect,
         np.zeros(sort_defect.shape),

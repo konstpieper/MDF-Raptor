@@ -641,6 +641,8 @@ class ActiveLearningOrchestrator:
             self.mean_grid = np.asarray(y_grid)
             self.variance_grid = np.asarray(yerr_grid) ** 2
 
+            self.time_log.append((time.perf_counter(), "Saving data."))
+
             np.savez(
                 "defect_model_surrogate_2.npz",
                 mean_grid=self.mean_grid,
@@ -656,6 +658,10 @@ class ActiveLearningOrchestrator:
                     self.scaler, dtype=object
                 ),  # save the scaler that was used
             )
+
+            live_plot = True
+            if live_plot:
+                do_live_plot(self)
 
             # Log timings:
             newevent = (time.perf_counter(), "Asking DIAL for next point x.")
@@ -724,6 +730,84 @@ class ActiveLearningOrchestrator:
         else:
             err_msg = f"Unknown operation received: {operation}"
             raise Exception(err_msg)  # noqa: TRY002
+
+
+# ----
+# plotting
+# ----
+
+
+def do_live_plot(
+    obj: ActiveLearningOrchestrator,
+    y_norm_grid: np.ndarray,
+    yerr_norm_grid: np.ndarray,
+):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_filename = f"raw_mean_std_{obj.iteration_count}.png"
+
+    fig, ax_tl = plt.subplots(
+        1, 1, figsize=(7, 6), subplot_kw={"projection": "3d"}
+    )
+
+    n_grids = (N_GRIDS[1], N_GRIDS[0])
+    points_unit = np.asarray(
+        obj.input_scaler.to_unit(INITIAL_POINTS_TO_PREDICT)
+    )
+    x_grid = [
+        points_unit[:, 0].reshape(n_grids),
+        points_unit[:, 1].reshape(n_grids),
+    ]
+    y_pred = y_norm_grid.reshape(n_grids) / 3.0
+    y_band = yerr_norm_grid.reshape(n_grids) / 3.0
+
+    ax_tl.plot_surface(
+        x_grid[0], x_grid[1], y_pred, cmap="viridis"
+    )  # type: ignore[attr-defined]
+
+    CONTOUR_OFFSET = -4.0
+    contour_plot_tl = ax_tl.contour(
+        x_grid[0], x_grid[1], y_band, linestyles="solid", offset=CONTOUR_OFFSET
+    )
+    cbar = fig.colorbar(contour_plot_tl, ax=ax_tl)
+    cbar.set_label("Predicted error of surrogate model.")
+    ax_tl.set_xlim((0, 1))
+    ax_tl.set_ylim((0, 1))
+    ax_tl.set_zlim((CONTOUR_OFFSET, 1))  # type: ignore[attr-defined]
+    ax_tl.set_title("learned")
+
+    # ── Acquired training data on the truth panel ──
+    x_train = np.asarray(obj.input_scaler.to_unit(obj.dataset_x))
+    y_norm, yerr_norm = obj.scaler.scale(obj.dataset_y, obj.dataset_yerr)
+    # y_train = np.asarray(y_norm)
+    ye = np.asarray(yerr_norm)
+    if x_train.shape[0] > 0:
+        dotsize = (
+            10.0 * ye / np.max(ye)
+            if np.max(ye) > 0
+            else 10.0 * np.ones_like(ye)
+        )
+        ax_tl.scatter(
+            x_train[:, 0],
+            x_train[:, 1],
+            np.full(ye.shape, CONTOUR_OFFSET),
+            s=dotsize,
+            alpha=1,
+            zorder=10,
+            color="tab:orange",
+            label="Acquired values",
+        )
+
+    ax_tl.view_init(elev=25, azim=130 + 180)  # type: ignore[attr-defined]
+    ax_tl.set_title(output_filename)
+    plt.tight_layout()
+    output_path = Path("live_plots")
+    output_path.mkdir(exist_ok=True)
+    plt.savefig(output_path / output_filename, dpi=300)
+    plt.close()
 
 
 # -----------------------------------------------------------------------------
