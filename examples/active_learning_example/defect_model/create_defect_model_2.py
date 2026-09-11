@@ -38,8 +38,9 @@ from intersect_sdk import (
 from dial_dataclass import (
     DialInputPredictions,
     DialInputSingleOtherStrategy,
+    DialInputMultipleOtherStrategy,
     DialWorkflowCreationParamsClient,
-    DialWorkflowDatasetUpdate,
+    DialWorkflowDatasetUpdates,
     Normal,
 )
 
@@ -68,20 +69,21 @@ HATCH_BOUNDS = (60e-6, 140e-6)
 LAYER_HEIGHT_BOUNDS = (20e-6, 90e-6)  # microns
 BOUNDS = (HATCH_BOUNDS, LAYER_HEIGHT_BOUNDS)
 NUM_DIMS = len(BOUNDS)
-UNIT_BOUNDS = ((0.0, 1.0),) * NUM_DIMS
-
-INITIAL_DATA_SIZE = 4
-MAX_ITERATIONS = 400
 
 VOXEL_RESOLUTION_M = 5.0e-6  # reference 5.0e-6
 RVE_LENGTH_M = 2e-3
-QUERY_VOLUME_MM3 = 8.0  # decrease query_volume_mm3 from 10 to speed up
+QUERY_VOLUME_MM3 = (
+    3 * 8.0
+)  # decrease query_volume_mm3 factor * rve_volume to speed up
 
-MIN_LEN_DEFECTS = 50
+MIN_LEN_DEFECTS = 100
 
 SEED = 42
 
 
+# -----------------------------------------------------------------------------
+# AL PARAMETERS
+# -----------------------------------------------------------------------------
 class AnalysisMode(str, Enum):
     MEAN = "mean"
     WEIGHTED_MEAN = "weighted_mean"
@@ -93,9 +95,16 @@ class AnalysisMode(str, Enum):
 
 ANALYZE = AnalysisMode.CVAR
 
-BACKEND = "sable"  # "sable" or "sklearn"
+INITIAL_DATA_SIZE = 1  # size of the initial data batch >=1
+MAX_ITERATIONS = (
+    200  # total number of points to acquire (after initial_dataset)
+)
 
-MESHGRID_SIZE = 150
+BACKEND = "sable"  # "sable" or "sklearn"
+STATISTICS_YERR = (
+    1e-2  # either a noise value, e.g., 1e-2 or "yerr" for the data noise
+)
+BATCHSIZE = 5  # batch size for planning (>=1, 1 is single acquisition)
 
 N_GRIDS = (80, 70)
 
@@ -403,8 +412,10 @@ def process_raptor_data(raptor_data):
     if ANALYZE.startswith("log") or ANALYZE == "cvar":
         # Statistics lose meaning when max defect approaches the RVE length.
         # return a large enough value with high certainty
-        if max_pore > RVE_LENGTH_M / 4:
-            y = max(y, RVE_LENGTH_M / 4)
+        cutoff_for_max_pore = RVE_LENGTH_M / 10.0
+        if y > cutoff_for_max_pore:
+            # or max_pore > cutoff_for_max_pore:
+            y = cutoff_for_max_pore
             yerr = y * 1e-4
 
     return y, yerr
@@ -443,6 +454,36 @@ class ActiveLearningOrchestrator:
             (time.perf_counter(), "Initialization and initial dataset.")
         ]
 
+        self._init_dataset()
+
+        scaler = "output_focus_log"
+        if scaler == "lop1p":
+            # Scaling factors before and after the log transform.
+            # Output scaling also affects the acquisition-strategy error bar.
+            pre_to_post_scale_ratio = 0.05
+            y_prescale = pre_to_post_scale_ratio * np.max(self.dataset_y)
+            y_postscale = np.log1p(1 / pre_to_post_scale_ratio)
+            self.scaler = SCALER_REGISTRY[scaler](
+                y_prescale=y_prescale, y_postscale=y_postscale
+            )
+        elif scaler.startswith("output_focus"):
+            D_CRIT_LIST = [20e-6, 40e-6]
+            # [y_low, y_high] roughly outlines the "interesting" output region
+            y_low = min(D_CRIT_LIST)
+            y_high = max(D_CRIT_LIST)
+            # Focus zooms in (> 1) or out (< 1) on the target region.
+            focus = 3.0
+            self.scaler = SCALER_REGISTRY[scaler](
+                y_low=y_low, y_high=y_high, focus=focus
+            )
+
+        self.input_scaler = InputScaler(bounds=list(BOUNDS))
+        self.dataset_x_unit = self.input_scaler.to_unit(self.dataset_x)
+        self.bounds_unit = list(
+            zip(*self.input_scaler.to_unit(list(zip(*BOUNDS))))
+        )
+
+    def _init_dataset(self):
         logger.info(f"Performing cold start with {INITIAL_DATA_SIZE} points...")
         bounds = np.array(BOUNDS)
         lhs = qmc.LatinHypercube(d=NUM_DIMS, seed=SEED)
@@ -461,31 +502,59 @@ class ActiveLearningOrchestrator:
             self.dataset_raptor,
         ) = [list(tup) for tup in zip(*initial_dataset)]
 
-        scaler = "output_focus_log"
-        if scaler == "lop1p":
-            # Scaling factors before and after the log transform.
-            # Output scaling also affects the acquisition-strategy error bar.
-            pre_to_post_scale_ratio = 0.05
-            y_prescale = pre_to_post_scale_ratio * np.max(self.dataset_y)
-            y_postscale = np.log1p(1 / pre_to_post_scale_ratio)
-            self.scaler = SCALER_REGISTRY[scaler](
-                y_prescale=y_prescale, y_postscale=y_postscale
-            )
-        elif scaler.startswith("output_focus"):
-            # D_CRIT_LIST = [10e-6, 20e-6, 40e-6]
-            D_CRIT_LIST = [20e-6, 30e-6, 40e-6]
-            # [y_low, y_high] roughly outlines the "interesting" output region
-            y_low = min(D_CRIT_LIST)
-            y_high = max(D_CRIT_LIST)
-            # Focus zooms in (> 1) or out (< 1) on the target region.
-            focus = 3.0
-            self.scaler = SCALER_REGISTRY[scaler](
-                y_low=y_low, y_high=y_high, focus=focus
-            )
+    def _handle_surrogate_values(self, means, stddevs):
+        y_norm_grid = np.array(means)
+        yerr_norm_grid = np.array(stddevs)
 
-        self.input_scaler = InputScaler(bounds=list(BOUNDS))
-        self.dataset_x_unit = self.input_scaler.to_unit(self.dataset_x)
-        self.bounds_unit = UNIT_BOUNDS
+        # rescale / transform data back to original units for saving
+        y_grid, yerr_grid = self.scaler.unscale(y_norm_grid, yerr_norm_grid)
+
+        self.mean_grid = np.asarray(y_grid)
+        self.variance_grid = np.asarray(yerr_grid) ** 2
+
+        self.time_log.append((time.perf_counter(), "Saving data."))
+
+        np.savez(
+            "defect_model_surrogate_2.npz",
+            mean_grid=self.mean_grid,
+            variance_grid=self.variance_grid,
+            dataset_x=self.dataset_x,
+            dataset_y=self.dataset_y,
+            dataset_yerr=self.dataset_yerr,
+            bounds=BOUNDS,
+            n_grids=N_GRIDS,
+            laser_power=LASER_POWER_WATTS,
+            laser_velocity=LASER_VELOCITY_M_S,
+            scaler=np.array(
+                self.scaler, dtype=object
+            ),  # save the scaler that was used
+        )
+
+        live_plot = True
+        if live_plot:
+            do_live_plot(self, y_norm_grid, yerr_norm_grid)
+
+    def _handle_one_new_input(self, x_suggested):
+        logger.info(
+            f"Iteration {self.iteration_count}: "
+            f"DIAL suggests HS={x_suggested[0]*1e6:.2f}um, "
+            f"LH={x_suggested[1]*1e6:.2f}."
+        )
+        self.time_log.append(
+            (time.perf_counter(), "Running Raptor to evaluate output data.")
+        )
+
+        new_x, new_y, new_yerr, new_raptor_data = get_data_point(
+            x_suggested, self.mp_interpolator
+        )
+
+        self.dataset_x.append(new_x)
+        self.dataset_raptor.append(new_raptor_data)
+        self.dataset_y.append(new_y)
+        self.dataset_yerr.append(new_yerr)
+        self.dataset_x_unit.append(self.input_scaler.to_unit(new_x))
+
+        self.iteration_count += 1
 
     def assemble_message(
         self, operation: str, **kwargs: Any
@@ -498,9 +567,10 @@ class ActiveLearningOrchestrator:
             )
             # configure the output statistics and combined dataset
             self.labels_y = ["y", "yerr"]
-            self.statistics_y = Normal(loc="y", scale="yerr")
-            # self.statistics_y = Normal(loc="y", scale=1e-4)
             initial_dataset_y = list(zip(y_norm, yerr_norm))
+
+            # configure the statistics used for learning
+            self.statistics_y = Normal(loc="y", scale=STATISTICS_YERR)
 
             # Prior kernel variance (uncertainty without data).
             prior_std = 1.5
@@ -522,17 +592,17 @@ class ActiveLearningOrchestrator:
                 self.kernel_args = {
                     # x range of the data
                     # DIAL currently normalizes the bounds to [0, 1].
-                    "x_range": self.bounds_unit[0],
+                    "x_range": (0, 1),
                     # sigma range of valid lengthscales
-                    "sigma_range": [1e-2, 0.5],
+                    "sigma_range": [5e-2, 0.5],
                     # smoothness hyperparameter gamma
                     # 0 is continuous, 1 is once differentiable, and so on.
-                    "gamma": 0.3,
+                    "gamma": 0.6,
                 }
                 self.backend_args = {
                     # memory size for number of features:
                     # More features increase capacity and runtime.
-                    "n_features": 10000,
+                    "n_features": 2000,
                     # prior standard deviation
                     "prior_std": prior_std,
                     # algorithm hyperparameters
@@ -557,27 +627,31 @@ class ActiveLearningOrchestrator:
                 preprocess_standardize=False,
             )
 
-        elif operation == "update_workflow_with_data":
+        elif operation == "update_workflow_with_batch_data":
             try:
                 next_x = kwargs["next_x"]
                 next_y = kwargs["next_y"]
             except Exception as error:
-                print(f"could not extract next datapoint for update: {error}")
+                print(f"could not extract next datapoints for update: {error}")
 
-            # normalize / transform the output data
-            y, yerr = next_y
-            y_norm, yerr_norm = self.scaler.scale(y, yerr)
-            next_y = [y_norm, yerr_norm]
-
-            payload = DialWorkflowDatasetUpdate(
+            payload = DialWorkflowDatasetUpdates(
                 workflow_id=self.workflow_id,
                 backend_args=self.backend_args,
-                next_x=next_x,
-                next_y=next_y,
+                next_x_list=next_x,
+                next_y_list=next_y,
             )
         elif operation == "get_next_point":
             payload = DialInputSingleOtherStrategy(
                 workflow_id=self.workflow_id,
+                strategy="upper_confidence_bound",
+                strategy_args={"exploit": 0.0, "explore": 1.0},
+                bounds=self.bounds_unit,
+            )
+        elif operation == "get_next_points":
+            payload = DialInputMultipleOtherStrategy(
+                workflow_id=self.workflow_id,
+                points=BATCHSIZE,
+                batch_strategy="believer",
                 strategy="upper_confidence_bound",
                 strategy_args={"exploit": 0.0, "explore": 1.0},
                 bounds=self.bounds_unit,
@@ -619,7 +693,7 @@ class ActiveLearningOrchestrator:
             )
             return self.assemble_message("get_surrogate_values")
 
-        if operation == "dial.update_workflow_with_data":
+        if operation == "dial.update_workflow_with_batch_data":
             self.time_log.append(
                 (time.perf_counter(), "Asking DIAL for surrogate eval.")
             )
@@ -632,39 +706,13 @@ class ActiveLearningOrchestrator:
             except Exception as error:
                 print(f"Could not read surrogate values from payload: {error}")
 
-            y_norm_grid = np.array(means)
-            yerr_norm_grid = np.array(stddevs)
-
-            # rescale / transform data back to original units for saving
-            y_grid, yerr_grid = self.scaler.unscale(y_norm_grid, yerr_norm_grid)
-
-            self.mean_grid = np.asarray(y_grid)
-            self.variance_grid = np.asarray(yerr_grid) ** 2
-
-            self.time_log.append((time.perf_counter(), "Saving data."))
-
-            np.savez(
-                "defect_model_surrogate_2.npz",
-                mean_grid=self.mean_grid,
-                variance_grid=self.variance_grid,
-                dataset_x=self.dataset_x,
-                dataset_y=self.dataset_y,
-                dataset_yerr=self.dataset_yerr,
-                bounds=BOUNDS,
-                n_grids=N_GRIDS,
-                laser_power=LASER_POWER_WATTS,
-                laser_velocity=LASER_VELOCITY_M_S,
-                scaler=np.array(
-                    self.scaler, dtype=object
-                ),  # save the scaler that was used
-            )
-
-            live_plot = True
-            if live_plot:
-                do_live_plot(self)
+            self._handle_surrogate_values(means, stddevs)
 
             # Log timings:
-            newevent = (time.perf_counter(), "Asking DIAL for next point x.")
+            newevent = (
+                time.perf_counter(),
+                f"Asking DIAL for {BATCHSIZE} next points x.",
+            )
             for (t0, e0), (t1, e1_) in zip(
                 self.time_log,
                 self.time_log[1:] + [newevent],
@@ -681,48 +729,41 @@ class ActiveLearningOrchestrator:
                 )
                 raise Exception("DONE")
 
-            return self.assemble_message("get_next_point")
+            if BATCHSIZE == 1:
+                return self.assemble_message("get_next_point")
+            else:
+                return self.assemble_message("get_next_points")
 
-        if operation == "dial.get_next_point":
+        if (
+            operation == "dial.get_next_points"
+            or operation == "dial.get_next_point"
+        ):
             try:
                 data = payload["data"]
             except Exception as error:
                 print(f"Could not read next point from payload: {error}")
 
-            x_suggested_unit = np.array(data).reshape(1, -1)
-            x_suggested = self.input_scaler.from_unit(x_suggested_unit)[0]
+            x_suggested_unit = np.array(data).reshape(BATCHSIZE, NUM_DIMS)
+            x_suggested = self.input_scaler.from_unit(x_suggested_unit)
 
-            logger.info(
-                f"Iteration {self.iteration_count}: "
-                f"DIAL suggests HS={x_suggested[0]*1e6:.2f}um, "
-                f"LH={x_suggested[1]*1e6:.2f}."
-            )
-            self.time_log.append(
-                (time.perf_counter(), "Running Raptor to evaluate output data.")
-            )
+            for x in x_suggested:
+                self._handle_one_new_input(x)
 
-            new_x, new_y, new_yerr, new_raptor_data = get_data_point(
-                x_suggested, self.mp_interpolator
-            )
+            # prepare collected data for sending
+            next_x = x_suggested_unit.tolist()
+            n_acquired = len(x_suggested)
+            next_y_raw = self.dataset_y[-n_acquired:]
+            next_yerr_raw = self.dataset_yerr[-n_acquired:]
 
-            self.dataset_x.append(new_x)
-            self.dataset_raptor.append(new_raptor_data)
-            self.dataset_y.append(new_y)
-            self.dataset_yerr.append(new_yerr)
-
-            # determine the next data (x, y) for the update message
-            next_y = [float(new_y), float(new_yerr)]
-            next_x = self.input_scaler.to_unit(new_x)
-
-            self.dataset_x_unit.append(next_x)
-
-            self.iteration_count += 1
+            # normalize / transform the output data
+            y_norm, yerr_norm = self.scaler.scale(next_y_raw, next_yerr_raw)
+            next_y = [list(item) for item in zip(y_norm, yerr_norm)]
 
             self.time_log.append(
                 (time.perf_counter(), "Sending new (x,y) data to DIAL.")
             )
             return self.assemble_message(
-                "update_workflow_with_data",
+                "update_workflow_with_batch_data",
                 next_x=next_x,
                 next_y=next_y,
             )
@@ -735,8 +776,6 @@ class ActiveLearningOrchestrator:
 # ----
 # plotting
 # ----
-
-
 def do_live_plot(
     obj: ActiveLearningOrchestrator,
     y_norm_grid: np.ndarray,
@@ -799,7 +838,7 @@ def do_live_plot(
             zorder=10,
             color="tab:orange",
             label="Acquired values",
-        )
+        )  # type: ignore[misc]
 
     ax_tl.view_init(elev=25, azim=130 + 180)  # type: ignore[attr-defined]
     ax_tl.set_title(output_filename)
