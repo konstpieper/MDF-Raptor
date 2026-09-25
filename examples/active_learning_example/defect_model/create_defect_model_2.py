@@ -106,7 +106,11 @@ STATISTICS_YERR = (
 )
 BATCHSIZE = 5  # batch size for planning (>=1, 1 is single acquisition)
 
+# grid size for plotting and saving
 N_GRIDS = (80, 70)
+
+# if positive, dial only suggests points on n_acquire_grid^dim grid
+N_ACQUIRE_GRID = -1  # -1 or positive number
 
 
 def meshgrid_2d():
@@ -492,6 +496,12 @@ class ActiveLearningOrchestrator:
             zip(*self.input_scaler.to_unit(list(zip(*BOUNDS))))
         )
 
+        # acquire on a grid, or on the whole input cube
+        if N_ACQUIRE_GRID > 0:
+            self.discrete_measurements = [N_ACQUIRE_GRID] * NUM_DIMS
+        else:
+            self.discrete_measurements = []
+
     def _init_dataset(self):
         logger.info(f"Performing cold start with {INITIAL_DATA_SIZE} points...")
         bounds = np.array(BOUNDS)
@@ -654,6 +664,8 @@ class ActiveLearningOrchestrator:
                 workflow_id=self.workflow_id,
                 strategy="upper_confidence_bound",
                 strategy_args={"exploit": 0.0, "explore": 1.0},
+                discrete_measurements=bool(self.discrete_measurements),
+                discrete_measurement_grid_size=self.discrete_measurements,
                 bounds=self.bounds_unit,
             )
         elif operation == "get_next_points":
@@ -663,6 +675,8 @@ class ActiveLearningOrchestrator:
                 batch_strategy="believer",
                 strategy="upper_confidence_bound",
                 strategy_args={"exploit": 0.0, "explore": 1.0},
+                discrete_measurements=bool(self.discrete_measurements),
+                discrete_measurement_grid_size=self.discrete_measurements,
                 bounds=self.bounds_unit,
             )
         elif operation == "get_surrogate_values":
