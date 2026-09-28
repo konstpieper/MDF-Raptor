@@ -132,7 +132,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--file",
         type=str,
-        default="defect_model_surrogate.npz",
+        default="defect_model_surrogate_1.npz",
         help="Path to the saved .npz surrogate file.",
     )
     args = parser.parse_args()

@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import random
+import time
 from pathlib import Path
 from typing import Any
 from enum import Enum
@@ -37,8 +38,9 @@ from intersect_sdk import (
 from dial_dataclass import (
     DialInputPredictions,
     DialInputSingleOtherStrategy,
+    DialInputMultipleOtherStrategy,
     DialWorkflowCreationParamsClient,
-    DialWorkflowDatasetUpdate,
+    DialWorkflowDatasetUpdates,
     Normal,
 )
 
@@ -46,7 +48,7 @@ from scalers import SCALER_REGISTRY, InputScaler
 from statistics_utilities import (
     estimate_lognormal_direct,
     estimate_lognormal_MCMC,
-    estimate_cvar,
+    bootstrap_cvar,
     estimate_lognormal_cvar,
     plot_defect_distribution,
 )
@@ -63,37 +65,55 @@ logger = logging.getLogger(__name__)
 LASER_POWER_WATTS = 195
 LASER_VELOCITY_M_S = 1.083
 
-BOUNDS = ((80e-6, 150e-6),)
-UNIT_BOUNDS = ((0.0, 1.0),)
+HATCH_BOUNDS = (60e-6, 140e-6)
+LAYER_HEIGHT_BOUNDS = (20e-6, 90e-6)  # microns
+
+LAYER_THICKNESS = 40e-6
+BOUNDS = (HATCH_BOUNDS,)
 NUM_DIMS = len(BOUNDS)
 
-INITIAL_DATA_SIZE = 1
-MAX_ITERATIONS = 15
+VOXEL_RESOLUTION_M = 5.0e-6  # reference 5.0e-6
+RVE_LENGTH_M = 2e-3
+QUERY_VOLUME_MM3 = (
+    3 * 8.0
+)  # decrease query_volume_mm3 factor * rve_volume to speed up
+
+MIN_LEN_DEFECTS = 100
 
 SEED = 42
 
-VOXEL_RESOLUTION_M = 5.0e-6  # reference 5.0e-6
-RVE_LENGTH_M = 1e-3
-QUERY_VOLUME_MM3 = 1.0  # decrease query_volume_mm3 from 10 to speed up
 
-MIN_LEN_DEFECTS = 50
-
-
+# -----------------------------------------------------------------------------
+# AL PARAMETERS
+# -----------------------------------------------------------------------------
 class AnalysisMode(str, Enum):
     MEAN = "mean"
+    WEIGHTED_MEAN = "weighted_mean"
     MAX = "max"
     LOG_MEAN = "log_mean"
     LOG_CVAR = "log_cvar"
+    CVAR = "cvar"
 
 
-ANALYZE = AnalysisMode.LOG_CVAR
+ANALYZE = AnalysisMode.CVAR
+
+INITIAL_DATA_SIZE = 1  # size of the initial data batch >=1
+MAX_ITERATIONS = 20  # total number of points to acquire (after initial_dataset)
 
 BACKEND = "sable"  # "sable" or "sklearn"
+STATISTICS_YERR = (
+    1e-2  # either a noise value, e.g., 1e-2 or "yerr" for the data noise
+)
+BATCHSIZE = 5  # batch size for planning (>=1, 1 is single acquisition)
 
-MESHGRID_SIZE = 150
+# grid size for plotting and saving
+N_GRIDS = (150,)
+
+# if positive, dial only suggests points on n_acquire_grid^dim grid
+N_ACQUIRE_GRID = -1  # -1 or positive number
 
 INITIAL_POINTS_TO_PREDICT = np.linspace(
-    BOUNDS[0][0], BOUNDS[0][1], MESHGRID_SIZE
+    BOUNDS[0][0], BOUNDS[0][1], N_GRIDS[0]
 ).reshape(-1, 1)
 
 MELT_POOL_SURROGATE_PATH = os.path.abspath(
@@ -143,7 +163,7 @@ def run_raptor(
     layer_thickness_m: float = 40e-6,
     query_volume_mm3: float = QUERY_VOLUME_MM3,
     voxel_resolution_m: float = VOXEL_RESOLUTION_M,
-    metric_names: list[str] = ["equivalent_diameter_area"],
+    metric_names: list[str] = ["equivalent_diameter_area", "area"],
 ):
     # Query melt pool statistics for processing conditions
     mp_stats = mp_interpolator.query(LASER_VELOCITY_M_S, LASER_POWER_WATTS)
@@ -189,7 +209,7 @@ def run_raptor(
     ellipse = 2
     parabola = 1
 
-    # Auto-select modes using the spatial resolution as the RMSE target.
+    # auto-select modes and signal duration
     num_modes = None
     mode_rmse = voxel_resolution_m
 
@@ -208,6 +228,7 @@ def run_raptor(
             parabola,
         ),
     }
+
     melt_pool = create_melt_pool(
         melt_pool_dict,
         enable_random_phases=True,
@@ -263,8 +284,11 @@ def run_raptor(
 def process_raptor_data(raptor_data):
 
     voxel_resolution_m = raptor_data["inputs"]["voxel_resolution_m"]
-    combined_defects = raptor_data["outputs"]["equivalent_diameter_area"]
     hatch_spacing = raptor_data["inputs"]["hatch_spacing_m"]
+    layer_thickness = raptor_data["inputs"]["layer_thickness_m"]
+
+    combined_defects = raptor_data["outputs"]["equivalent_diameter_area"]
+    combined_area = raptor_data["outputs"]["area"]
 
     min_len_defects = MIN_LEN_DEFECTS
     if len(combined_defects) < min_len_defects:
@@ -277,8 +301,11 @@ def process_raptor_data(raptor_data):
         sigma_subgrid = voxel_resolution_m / 6
         more_defects = np.random.lognormal(
             np.log(mu_subgrid), sigma_subgrid / mu_subgrid, n_extra_defects
-        ).tolist()
-        combined_defects = combined_defects.tolist() + more_defects
+        )
+        combined_defects = combined_defects.tolist() + more_defects.tolist()
+        combined_area = (
+            combined_area.tolist() + (more_defects**3 * np.pi / 6).tolist()
+        )
 
     # direct analysis of mean, max and statistics
     max_pore = np.max(combined_defects)
@@ -287,54 +314,77 @@ def process_raptor_data(raptor_data):
     # Compute the standard error of the mean (Monte Carlo error).
     sem_pore = std_pore / np.sqrt(len(combined_defects))
 
+    # weighted mean
+    w_mean_pore = np.average(combined_defects, weights=combined_area)
+    w_std_pore = np.sqrt(
+        np.average((combined_defects - w_mean_pore) ** 2, weights=combined_area)
+    )
+    w_sem_pore = w_std_pore / np.sqrt(len(combined_defects))
+
     # estimate distribution parameters for lognormal pore size distribution
     # Converting to microns for numerical stability
     sort_defect = np.sort(np.array(combined_defects) * 1e6)
 
     # direct estimate
     lognormal_params = estimate_lognormal_direct(sort_defect)
+    (log_mean, log_sem), (log_std, log_sev) = lognormal_params
 
     # MCMC estimate
-    logger.info("running MCMC")
-    lognormal_params_MCMC = estimate_lognormal_MCMC(sort_defect)
+    run_MCMC = False
+    if run_MCMC:
+        logger.info("running MCMC")
+        lognormal_params_MCMC = estimate_lognormal_MCMC(sort_defect)
 
-    # TODO: Account for the different SEV scaling when converting to meters.
-    (log_mean, log_sem), (log_std, log_sev) = lognormal_params
-    (log_mean_pore, log_sem_pore), (log_std_pore, log_sev_pore) = (
-        lognormal_params_MCMC
-    )
+        (log_mean_pore, log_sem_pore), (log_std_pore, log_sev_pore) = (
+            lognormal_params_MCMC
+        )
 
-    # Approach 1 and 2 should give the same answer
-    print(f"-{len(combined_defects)}-\texpl.,\tMCMC")
-    print(f"mean:\t{log_mean:.3f},\t{log_mean_pore:.3f}")
-    print(f"std:\t{log_std:.3f},\t{log_std_pore:.3f}")
-    print(f"sem:\t{log_sem:.3f},\t{log_sem_pore:.3f}")
-    print(f"sev:\t{log_sev:.3f},\t{log_sev_pore:.3f}")
+        # Approach 1 and 2 should give the same answer
+        print(f"-{len(combined_defects)}-\texpl.,\tMCMC")
+        print(f"mean:\t{log_mean:.3f},\t{log_mean_pore:.3f}")
+        print(f"std:\t{log_std:.3f},\t{log_std_pore:.3f}")
+        print(f"sem:\t{log_sem:.3f},\t{log_sem_pore:.3f}")
+        print(f"sev:\t{log_sev:.3f},\t{log_sev_pore:.3f}")
 
     # Set the CVAR estimation level in (0.0, 1.0).
-    cvar_level = 0.2
+    cvar_level = 0.01
 
     # Use the lognormal estimates to estimate CVAR with error
     mean_cvar, err_cvar = estimate_lognormal_cvar(
         lognormal_params, cvar_level=cvar_level
     )
-    print(f"naive CVAR: {estimate_cvar(sort_defect, cvar_level):0.3f}")
-    print(
-        f"estimated CVAR based on lognormal distr: {mean_cvar=:.3f}, "
-        f"{err_cvar=:0.3f}"
+    logger.info(
+        "estimated CVAR based on lognormal distr: "
+        f"{mean_cvar=:.3f}, {err_cvar=:0.3f}"
     )
+
+    mean_cvar_bs, err_cvar_bs = bootstrap_cvar(
+        sort_defect, cvar_level=cvar_level
+    )
+    logger.info(
+        f"bootstrapped direct CVAR: {mean_cvar_bs=:.3f}, {err_cvar_bs=:0.3f}"
+    )
+
     # transform back to meters
     mean_cvar = mean_cvar.item() / 1e6
     err_cvar = err_cvar.item() / 1e6
+    mean_cvar_bs = mean_cvar_bs.item() / 1e6
+    err_cvar_bs = err_cvar_bs.item() / 1e6
 
     logger.info("plotting pore distribution")
-    output_filename = f"pore_{hatch_spacing*1e6:.1f}.png"
+    output_filename = (
+        f"pore_{hatch_spacing*1e6:.1f}_{layer_thickness*1e6:.1f}.png"
+    )
     plot_defect_distribution(
         output_filename,
         sort_defect,
         (mean_pore, std_pore),
         lognormal_params,
-        (mean_cvar, err_cvar),
+        (
+            (mean_cvar, err_cvar)
+            if ANALYZE == "log_cvar"
+            else (mean_cvar_bs, err_cvar_bs)
+        ),
     )
 
     # renormalization and exponential transform, to compare and inspect values
@@ -342,13 +392,12 @@ def process_raptor_data(raptor_data):
     sem_lognormal = log_sem.item() * mean_lognormal
     logger.info(
         f"Found {len(combined_defects)} defects: "
-        f"Hatch: {hatch_spacing*1e6:.1f}um | "
-        f"Mean and Max Pore: {mean_pore*1e6:.2f}, "
-        f"{max_pore*1e6:.2f}um\n | "
+        f"Hatch: {hatch_spacing*1e6:.1f}um, "
+        f"LT: {layer_thickness*1e6:.1f}um\n | "
+        f"Mean, weighted mean and max Pore: {mean_pore*1e6:.2f},"
+        f" {w_mean_pore*1e6:.2f}, {max_pore*1e6:.2f}um\n | "
         f"Estimated mean_lognormal: {mean_lognormal*1e6:.6f}, "
         f"sem_lognormal: {sem_lognormal*1e6:.6f}\n | "
-        f"Estimated CVAR({cvar_level:.0%}): {mean_cvar*1e6:.6f}, "
-        f"err_CVAR {err_cvar*1e6:.6f}\n | "
         f"Learning {ANALYZE}."
     )
 
@@ -358,9 +407,22 @@ def process_raptor_data(raptor_data):
         y, yerr = float(mean_lognormal), float(sem_lognormal)
     elif ANALYZE == "log_cvar":
         y, yerr = float(mean_cvar), float(err_cvar)
+    elif ANALYZE == "cvar":
+        y, yerr = float(mean_cvar_bs), float(err_cvar_bs)
+    elif ANALYZE == "weighted_mean":
+        y, yerr = float(w_mean_pore), float(w_sem_pore)
     elif ANALYZE == "max":
         # Use standard deviation as the approximate maximum-pore error.
         y, yerr = float(max_pore), float(std_pore)
+
+    if ANALYZE.startswith("log") or ANALYZE == "cvar":
+        # Statistics lose meaning when max defect approaches the RVE length.
+        # return a large enough value with high certainty
+        cutoff_for_max_pore = RVE_LENGTH_M / 10.0
+        if y > cutoff_for_max_pore:
+            # or max_pore > cutoff_for_max_pore:
+            y = cutoff_for_max_pore
+            yerr = y * 1e-4
 
     return y, yerr
 
@@ -371,14 +433,16 @@ def process_raptor_data(raptor_data):
 
 
 def get_data_point(x_suggested, mp_interpolator):
-    x_ = [np.clip(x_suggested[0], BOUNDS[0][0], BOUNDS[0][1])]
+    bounds = np.asarray(BOUNDS)
+    x = np.clip(x_suggested, bounds[:, 0], bounds[:, 1]).tolist()
     raptor_data = run_raptor(
-        x_[0],
+        x[0],
         mp_interpolator,
+        layer_thickness_m=LAYER_THICKNESS,
         voxel_resolution_m=VOXEL_RESOLUTION_M,
     )
-    y_, yerr_ = process_raptor_data(raptor_data)
-    return x_, y_, yerr_, raptor_data
+    y, yerr = process_raptor_data(raptor_data)
+    return x, y, yerr, raptor_data
 
 
 # -----------------------------------------------------------------------------
@@ -392,30 +456,11 @@ class ActiveLearningOrchestrator:
 
         self.mp_interpolator = MeltPoolInterpolator(MELT_POOL_SURROGATE_PATH)
 
-        logger.info(f"Performing cold start with {INITIAL_DATA_SIZE} points...")
-        lhs = qmc.LatinHypercube(d=NUM_DIMS, seed=SEED)
-        lhs_samples = qmc.scale(
-            lhs.random(n=INITIAL_DATA_SIZE), [BOUNDS[0][0]], [BOUNDS[0][1]]
-        )
-        bounds_points = np.array([[BOUNDS[0][0]], [BOUNDS[0][1]]])
+        self.time_log = [
+            (time.perf_counter(), "Initialization and initial dataset.")
+        ]
 
-        self.dataset_x = np.vstack([lhs_samples, bounds_points]).tolist()
-        self.dataset_raptor = [
-            run_raptor(
-                x[0],
-                self.mp_interpolator,
-                voxel_resolution_m=VOXEL_RESOLUTION_M,
-            )
-            for x in self.dataset_x
-        ]
-        # pre-process the raw data to extract y value and yerr
-        dataset_statistics = [
-            process_raptor_data(raptor_data)
-            for raptor_data in self.dataset_raptor
-        ]
-        self.dataset_y, self.dataset_yerr = [
-            list(tuple) for tuple in zip(*dataset_statistics)
-        ]
+        self._init_dataset()
 
         scaler = "output_focus_log"
         if scaler == "lop1p":
@@ -428,19 +473,95 @@ class ActiveLearningOrchestrator:
                 y_prescale=y_prescale, y_postscale=y_postscale
             )
         elif scaler.startswith("output_focus"):
-            D_CRIT_LIST = [10e-6, 20e-6, 40e-6]
-            # [y_low, y_high] roghly outlines the "interesting" output region
+            D_CRIT_LIST = [20e-6, 40e-6]
+            # [y_low, y_high] roughly outlines the "interesting" output region
             y_low = min(D_CRIT_LIST)
             y_high = max(D_CRIT_LIST)
             # Focus zooms in (> 1) or out (< 1) on the target region.
-            focus = 2.0
+            focus = 3.0
             self.scaler = SCALER_REGISTRY[scaler](
                 y_low=y_low, y_high=y_high, focus=focus
             )
 
         self.input_scaler = InputScaler(bounds=list(BOUNDS))
         self.dataset_x_unit = self.input_scaler.to_unit(self.dataset_x)
-        self.bounds_unit = UNIT_BOUNDS
+        self.bounds_unit = list(
+            zip(*self.input_scaler.to_unit(list(zip(*BOUNDS))))
+        )
+
+        # acquire on a grid, or on the whole input cube
+        if N_ACQUIRE_GRID > 0:
+            self.discrete_measurements = [N_ACQUIRE_GRID] * NUM_DIMS
+        else:
+            self.discrete_measurements = []
+
+    def _init_dataset(self):
+        logger.info(f"Performing cold start with {INITIAL_DATA_SIZE} points...")
+        bounds = np.array(BOUNDS)
+        lhs = qmc.LatinHypercube(d=NUM_DIMS, seed=SEED)
+        lhs_samples = qmc.scale(
+            lhs.random(n=INITIAL_DATA_SIZE), bounds[:, 0], bounds[:, 1]
+        )
+
+        self.dataset_x = lhs_samples.tolist()
+        initial_dataset = [
+            get_data_point(x, self.mp_interpolator) for x in self.dataset_x
+        ]
+        (
+            self.dataset_x,
+            self.dataset_y,
+            self.dataset_yerr,
+            self.dataset_raptor,
+        ) = [list(tup) for tup in zip(*initial_dataset)]
+
+    def _handle_surrogate_values(self, means, stddevs):
+        y_norm_grid = np.array(means)
+        yerr_norm_grid = np.array(stddevs)
+
+        # rescale / transform data back to original units for saving
+        y_grid, yerr_grid = self.scaler.unscale(y_norm_grid, yerr_norm_grid)
+
+        self.mean_grid = np.asarray(y_grid)
+        self.variance_grid = np.asarray(yerr_grid) ** 2
+
+        self.time_log.append((time.perf_counter(), "Saving data."))
+
+        np.savez(
+            "defect_model_surrogate_1.npz",
+            mean_grid=self.mean_grid,
+            variance_grid=self.variance_grid,
+            dataset_x=self.dataset_x,
+            dataset_y=self.dataset_y,
+            dataset_yerr=self.dataset_yerr,
+            bounds=BOUNDS,
+            n_grids=N_GRIDS,
+            laser_power=LASER_POWER_WATTS,
+            laser_velocity=LASER_VELOCITY_M_S,
+            scaler=np.array(
+                self.scaler, dtype=object
+            ),  # save the scaler that was used
+        )
+
+    def _handle_one_new_input(self, x_suggested):
+        logger.info(
+            f"Iteration {self.iteration_count}: "
+            f"DIAL suggests HS={x_suggested[0]*1e6:.2f}um."
+        )
+        self.time_log.append(
+            (time.perf_counter(), "Running Raptor to evaluate output data.")
+        )
+
+        new_x, new_y, new_yerr, new_raptor_data = get_data_point(
+            x_suggested, self.mp_interpolator
+        )
+
+        self.dataset_x.append(new_x)
+        self.dataset_raptor.append(new_raptor_data)
+        self.dataset_y.append(new_y)
+        self.dataset_yerr.append(new_yerr)
+        self.dataset_x_unit.append(self.input_scaler.to_unit(new_x))
+
+        self.iteration_count += 1
 
     def assemble_message(
         self, operation: str, **kwargs: Any
@@ -453,8 +574,10 @@ class ActiveLearningOrchestrator:
             )
             # configure the output statistics and combined dataset
             self.labels_y = ["y", "yerr"]
-            self.statistics_y = Normal(loc="y", scale="yerr")
             initial_dataset_y = list(zip(y_norm, yerr_norm))
+
+            # configure the statistics used for learning
+            self.statistics_y = Normal(loc="y", scale=STATISTICS_YERR)
 
             # Prior kernel variance (uncertainty without data).
             prior_std = 1.5
@@ -476,22 +599,22 @@ class ActiveLearningOrchestrator:
                 self.kernel_args = {
                     # x range of the data
                     # DIAL currently normalizes the bounds to [0, 1].
-                    "x_range": self.bounds_unit[0],
+                    "x_range": (0, 1),
                     # sigma range of valid lengthscales
-                    "sigma_range": [1e-3, 0.5],
+                    "sigma_range": [5e-2, 0.5],
                     # smoothness hyperparameter gamma
                     # 0 is continuous, 1 is once differentiable, and so on.
-                    "gamma": 0.5,
+                    "gamma": 0.6,
                 }
                 self.backend_args = {
                     # memory size for number of features:
                     # More features increase capacity and runtime.
-                    "n_features": 10000,
+                    "n_features": 2000,
                     # prior standard deviation
                     "prior_std": prior_std,
                     # algorithm hyperparameters
                     # p=2 is a GP; p=1 is fully sparse.
-                    "p": 1.25,
+                    "p": 1.0,
                     # More optimization steps improve fit but cost runtime.
                     "n_iter_irls": 100,
                 }
@@ -507,33 +630,41 @@ class ActiveLearningOrchestrator:
                 backend=self.backend,
                 kernel_args=self.kernel_args,
                 backend_args=self.backend_args,
-                seed=SEED,
+                seed=-1,
                 preprocess_standardize=False,
             )
 
-        elif operation == "update_workflow_with_data":
+        elif operation == "update_workflow_with_batch_data":
             try:
                 next_x = kwargs["next_x"]
                 next_y = kwargs["next_y"]
             except Exception as error:
-                print(f"could not extract next datapoint for update: {error}")
+                print(f"could not extract next datapoints for update: {error}")
 
-            # normalize / transform the output data
-            y, yerr = next_y
-            y_norm, yerr_norm = self.scaler.scale(y, yerr)
-            next_y = [y_norm, yerr_norm]
-
-            payload = DialWorkflowDatasetUpdate(
+            payload = DialWorkflowDatasetUpdates(
                 workflow_id=self.workflow_id,
                 backend_args=self.backend_args,
-                next_x=next_x,
-                next_y=next_y,
+                next_x_list=next_x,
+                next_y_list=next_y,
             )
         elif operation == "get_next_point":
             payload = DialInputSingleOtherStrategy(
                 workflow_id=self.workflow_id,
                 strategy="upper_confidence_bound",
                 strategy_args={"exploit": 0.0, "explore": 1.0},
+                discrete_measurements=bool(self.discrete_measurements),
+                discrete_measurement_grid_size=self.discrete_measurements,
+                bounds=self.bounds_unit,
+            )
+        elif operation == "get_next_points":
+            payload = DialInputMultipleOtherStrategy(
+                workflow_id=self.workflow_id,
+                points=BATCHSIZE,
+                batch_strategy="believer",
+                strategy="upper_confidence_bound",
+                strategy_args={"exploit": 0.0, "explore": 1.0},
+                discrete_measurements=bool(self.discrete_measurements),
+                discrete_measurement_grid_size=self.discrete_measurements,
                 bounds=self.bounds_unit,
             )
         elif operation == "get_surrogate_values":
@@ -568,9 +699,15 @@ class ActiveLearningOrchestrator:
 
         if operation == "dial.initialize_workflow":
             self.workflow_id = payload
+            self.time_log.append(
+                (time.perf_counter(), "Asking DIAL for surrogate eval.")
+            )
             return self.assemble_message("get_surrogate_values")
 
-        if operation == "dial.update_workflow_with_data":
+        if operation == "dial.update_workflow_with_batch_data":
+            self.time_log.append(
+                (time.perf_counter(), "Asking DIAL for surrogate eval.")
+            )
             return self.assemble_message("get_surrogate_values")
 
         if operation == "dial.get_surrogate_values":
@@ -580,68 +717,64 @@ class ActiveLearningOrchestrator:
             except Exception as error:
                 print(f"Could not read surrogate values from payload: {error}")
 
-            y_norm_grid = np.array(means)
-            yerr_norm_grid = np.array(stddevs)
+            self._handle_surrogate_values(means, stddevs)
 
-            # rescale / transform data back to original units for saving
-            y_grid, yerr_grid = self.scaler.unscale(y_norm_grid, yerr_norm_grid)
-
-            self.mean_grid = np.asarray(y_grid)
-            self.variance_grid = np.asarray(yerr_grid) ** 2
-
-            np.savez(
-                "defect_model_surrogate.npz",
-                mean_grid=self.mean_grid,
-                variance_grid=self.variance_grid,
-                dataset_x=self.dataset_x,
-                dataset_y=self.dataset_y,
-                dataset_yerr=self.dataset_yerr,
-                bounds=BOUNDS,
-                laser_power=LASER_POWER_WATTS,
-                laser_velocity=LASER_VELOCITY_M_S,
+            # Log timings:
+            newevent = (
+                time.perf_counter(),
+                f"Asking DIAL for {BATCHSIZE} next points x.",
             )
+            for (t0, e0), (t1, e1_) in zip(
+                self.time_log,
+                self.time_log[1:] + [newevent],
+            ):
+                timespan = t1 - t0
+                logger.info(f"Timelog: took {timespan:6.2f}s for '{e0}'")
+
+            self.time_log = [newevent]
 
             if self.iteration_count >= MAX_ITERATIONS:
                 logger.info(
                     "Active Learning Complete. Surrogate saved to "
-                    "'defect_model_surrogate.npz'."
+                    "'defect_model_surrogate_2.npz'."
                 )
                 raise Exception("DONE")
-            return self.assemble_message("get_next_point")
 
-        if operation == "dial.get_next_point":
+            if BATCHSIZE == 1:
+                return self.assemble_message("get_next_point")
+            else:
+                return self.assemble_message("get_next_points")
+
+        if (
+            operation == "dial.get_next_points"
+            or operation == "dial.get_next_point"
+        ):
             try:
                 data = payload["data"]
             except Exception as error:
                 print(f"Could not read next point from payload: {error}")
 
-            x_suggested_unit = np.array(data).reshape(1, -1)
-            x_suggested = self.input_scaler.from_unit(x_suggested_unit)[0]
+            x_suggested_unit = np.array(data).reshape(BATCHSIZE, NUM_DIMS)
+            x_suggested = self.input_scaler.from_unit(x_suggested_unit)
 
-            logger.info(
-                f"Iteration {self.iteration_count}: "
-                f"DIAL suggests HS={x_suggested[0]*1e6:.2f}um"
+            for x in x_suggested:
+                self._handle_one_new_input(x)
+
+            # prepare collected data for sending
+            next_x = x_suggested_unit.tolist()
+            n_acquired = len(x_suggested)
+            next_y_raw = self.dataset_y[-n_acquired:]
+            next_yerr_raw = self.dataset_yerr[-n_acquired:]
+
+            # normalize / transform the output data
+            y_norm, yerr_norm = self.scaler.scale(next_y_raw, next_yerr_raw)
+            next_y = [list(item) for item in zip(y_norm, yerr_norm)]
+
+            self.time_log.append(
+                (time.perf_counter(), "Sending new (x,y) data to DIAL.")
             )
-
-            new_x, new_y, new_yerr, new_raptor_data = get_data_point(
-                x_suggested, self.mp_interpolator
-            )
-
-            self.dataset_x.append(new_x)
-            self.dataset_raptor.append(new_raptor_data)
-            self.dataset_y.append(new_y)
-            self.dataset_yerr.append(new_yerr)
-
-            # determine the next data (x, y) for the update message
-            next_y = [float(new_y), float(new_yerr)]
-            next_x = self.input_scaler.to_unit(new_x)
-
-            self.dataset_x_unit.append(next_x)
-
-            self.iteration_count += 1
-
             return self.assemble_message(
-                "update_workflow_with_data",
+                "update_workflow_with_batch_data",
                 next_x=next_x,
                 next_y=next_y,
             )
