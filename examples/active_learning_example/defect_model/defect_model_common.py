@@ -66,7 +66,7 @@ QUERY_VOLUME_MM3 = (
     3 * 8.0
 )  # decrease query_volume_mm3 factor * rve_volume to speed up
 
-MIN_LEN_DEFECTS = 100
+MIN_LEN_DEFECTS = 50
 
 SEED = 42
 
@@ -81,7 +81,7 @@ MELT_POOL_SURROGATE_PATH = (
 # RAPTOR UTILITIES
 # -----------------------------------------------------------------------------
 class MeltPoolInterpolator:
-    def __init__(self, filepath: str):
+    def __init__(self, filepath: Path | str):
         data = np.load(filepath)
         self.v_axis = data["velocity"]
         self.p_axis = data["power"]
@@ -204,35 +204,30 @@ def run_raptor(
 
     outputs = []
     for i in range(num_rves):
+        random_seed = SEED + i
         porosity = compute_porosity(
-            # TDOD save seed
             grid,
             path_vectors,
             melt_pool,
-            random_seed=SEED + i,
+            random_seed=random_seed,
         )
         metrics = compute_morphology(porosity, grid.resolution, metric_names)
+
+        # turn into list and add seed
+        metrics = {k: array.tolist() for k, array in metrics.items()}
+        metrics["seed"] = random_seed
+
         outputs.append(metrics)
 
-    combined_outputs = {}
-    for name in metric_names:
-        arrays = [out[name] for out in outputs if name in out]
-        if arrays:
-            combined_outputs[name] = np.concatenate(arrays)
-        else:
-            combined_outputs[name] = np.array([])
-
     # Package inputs and outputs
-    inputs = {
+    raptor_data = {
         "hatch_spacing_m": hatch_spacing_m,
         "layer_thickness_m": layer_thickness_m,
         "query_volume_mm3": query_volume_mm3,
         "voxel_resolution_m": voxel_resolution_m,
         "num_rves": num_rves,
+        "rve_metrics": outputs,
     }
-
-    raptor_data = {"inputs": inputs, "outputs": combined_outputs}
-
     return raptor_data
 
 
@@ -251,28 +246,36 @@ def process_raptor_data(
     min_len_defects=MIN_LEN_DEFECTS,
     cvar_level=0.05,
 ):
-    voxel_resolution_m = raptor_data["inputs"]["voxel_resolution_m"]
-    hatch_spacing = raptor_data["inputs"]["hatch_spacing_m"]
-    layer_thickness = raptor_data["inputs"]["layer_thickness_m"]
+    voxel_resolution_m = raptor_data["voxel_resolution_m"]
+    hatch_spacing = raptor_data["hatch_spacing_m"]
+    layer_thickness = raptor_data["layer_thickness_m"]
 
-    combined_defects = raptor_data["outputs"]["equivalent_diameter_area"]
-    combined_area = raptor_data["outputs"]["area"]
+    rve_metrics = raptor_data["rve_metrics"]
+    combined_defects_list: list[float] = []
+    combined_areas_list: list[float] = []
+    for metrics in rve_metrics:
+        defects = metrics["equivalent_diameter_area"]
+        areas = metrics["area"]
 
-    if len(combined_defects) < min_len_defects:
-        # Add sub-resolution pores when the resolved defect list is too short.
-        # TODO: decide how to represent pores below the voxel resolution.
-        # Explicitly seed the RNG from system entropy.
-        random.seed()
-        n_extra_defects = min_len_defects - len(combined_defects)
-        mu_subgrid = voxel_resolution_m / 2
-        sigma_subgrid = voxel_resolution_m / 6
-        more_defects = np.random.lognormal(
-            np.log(mu_subgrid), sigma_subgrid / mu_subgrid, n_extra_defects
-        )
-        combined_defects = combined_defects.tolist() + more_defects.tolist()
-        combined_area = (
-            combined_area.tolist() + (more_defects**3 * np.pi / 6).tolist()
-        )
+        if len(defects) < min_len_defects:
+            # Add sub-resolution pores when thedefect list is too short.
+            # TODO: refine how to represent pores below the voxel resolution.
+            # Explicitly seed the RNG from system entropy.
+            rng = np.random.default_rng()
+            n_extra_defects = min_len_defects - len(defects)
+            mu_subgrid = voxel_resolution_m / 2
+            sigma_subgrid = voxel_resolution_m / 6
+            more_defects = rng.lognormal(
+                np.log(mu_subgrid), sigma_subgrid / mu_subgrid, n_extra_defects
+            )
+            defects = defects + more_defects.tolist()
+            areas = areas + (more_defects**3 * np.pi / 6).tolist()
+
+        combined_defects_list.extend(defects)
+        combined_areas_list.extend(areas)
+
+    combined_defects = np.array(combined_defects_list)
+    combined_areas = np.array(combined_areas_list)
 
     # direct analysis of mean, max and statistics
     max_pore = np.max(combined_defects)
@@ -282,9 +285,11 @@ def process_raptor_data(
     sem_pore = std_pore / np.sqrt(len(combined_defects))
 
     # weighted mean
-    w_mean_pore = np.average(combined_defects, weights=combined_area)
+    w_mean_pore = np.average(combined_defects, weights=combined_areas)
     w_std_pore = np.sqrt(
-        np.average((combined_defects - w_mean_pore) ** 2, weights=combined_area)
+        np.average(
+            (combined_defects - w_mean_pore) ** 2, weights=combined_areas
+        )
     )
     w_sem_pore = w_std_pore / np.sqrt(len(combined_defects))
 

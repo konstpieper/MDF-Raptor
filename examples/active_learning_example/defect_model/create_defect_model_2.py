@@ -38,7 +38,7 @@ QUERY_VOLUME_MM3 = (
     3 * 8.0
 )  # decrease query_volume_mm3 factor * rve_volume to speed up
 
-MIN_LEN_DEFECTS = 100
+MIN_LEN_DEFECTS = 50
 
 
 # -----------------------------------------------------------------------------
@@ -54,7 +54,7 @@ MAX_ITERATIONS = (
 
 BACKEND = "sable"  # "sable" or "sklearn"
 STATISTICS_YERR = (
-    "yerr"  # either a noise value, e.g., 1e-2 or "yerr" for the data noise
+    1e-2  # either a noise value, e.g., 1e-2 or "yerr" for the data noise
 )
 BATCHSIZE = 5  # batch size for planning (>=1, 1 is single acquisition)
 
