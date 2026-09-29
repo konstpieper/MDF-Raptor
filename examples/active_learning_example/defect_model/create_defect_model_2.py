@@ -111,6 +111,13 @@ class ActiveLearningOrchestrator2D(ActiveLearningOrchestrator):
         return x, y, yerr, raptor_data
 
     def _save_dataset(self, *args):
+        with open("raptor_data_2.json", "w") as outfile:
+            json.dump(
+                self.dataset_raptor,
+                outfile,
+                indent="",
+            )
+
         np.savez(
             "defect_model_surrogate_2.npz",
             mean_grid=self.mean_grid,

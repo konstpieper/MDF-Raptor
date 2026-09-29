@@ -696,10 +696,7 @@ class ActiveLearningOrchestrator:
             self.time_log = [newevent]
 
             if self.iteration_count >= self.max_iterations:
-                logger.info(
-                    "Active Learning Complete. Surrogate saved to "
-                    "'defect_model_surrogate_1.npz'."
-                )
+                logger.info("Active Learning Complete.")
                 raise Exception("DONE")
 
             if self.batch_size == 1:

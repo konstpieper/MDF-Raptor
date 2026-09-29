@@ -46,7 +46,7 @@ MIN_LEN_DEFECTS = 100
 # AL PARAMETERS
 # -----------------------------------------------------------------------------
 ANALYZE = AnalysisMode.CVAR
-CVAR_LEVEL = 0.05  # level for CVAR analysis
+CVAR_LEVEL = 0.01  # level for CVAR analysis
 
 INITIAL_DATA_SIZE = 1  # size of the initial data batch >=1
 MAX_ITERATIONS = 20  # total number of points to acquire (after initial_dataset)
@@ -99,6 +99,13 @@ class ActiveLearningOrchestrator1D(ActiveLearningOrchestrator):
         return x, y, yerr, raptor_data
 
     def _save_dataset(self, *args):
+        with open("raptor_data_1.json", "w") as outfile:
+            json.dump(
+                self.dataset_raptor,
+                outfile,
+                indent="",
+            )
+
         np.savez(
             "defect_model_surrogate_1.npz",
             mean_grid=self.mean_grid,
